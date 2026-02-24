@@ -42,9 +42,9 @@ ACTUATOR_BOUNDS_DEG = [
 class Config:
     host: str = "localhost"
     port: int = 5055
-    invisible_cube_probability: float = 0       # default 1%
-    grab_cube_disappears_probability: float = 0 # default 10%
-    grab_cube_moves_probability: float = 1.0    # default 10%
+    invisible_cube_probability: float = 0.01      # default 1%
+    grab_cube_disappears_probability: float = 0.1 # default 10%
+    grab_cube_moves_probability: float = 0.1      # default 10%
 
 class JSONLWriter:
     """Simple incremental JSONL writer."""
