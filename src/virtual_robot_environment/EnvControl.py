@@ -12,6 +12,9 @@ from bpy_extras.object_utils import world_to_camera_view
 from mathutils import Euler, Vector 
 from mathutils.bvhtree import BVHTree
 
+DEBUG_RPC_LOGS = False
+SERVER_TIMER_INTERVAL_S = 0.02
+
 
 class RobotEnv:
     def __init__(self, fps: int=20):
@@ -48,6 +51,53 @@ class RobotEnv:
         self.light_fenster = bpy.data.objects["Fenster"]
         self.light_decke = bpy.data.objects["Decke"]
         self.light_sessel = bpy.data.objects["Sessel"]
+
+        # Track transform updates so repeated RPCs on the same pose do not force
+        # redundant dependency graph refreshes.
+        self._scene_dirty = True
+
+        # Cache collision pair objects once instead of rebuilding the list on every call.
+        self._collision_pairs = [
+            # primary arm
+            (self.robot_objects["primary arm"], self.robot_objects["secondary arm - part 2"]),
+            (self.robot_objects["primary arm"], self.robot_objects["tertiary arm - part 1"]),
+            (self.robot_objects["primary arm"], self.robot_objects["tertiary arm - part 2"]),
+            (self.robot_objects["primary arm"], self.robot_objects["finger - right"]),
+            (self.robot_objects["primary arm"], self.robot_objects["finger - left"]),
+            # secondary arm
+            (self.robot_objects["secondary arm - part 1"], self.workplate),
+            (self.robot_objects["secondary arm - part 1"], self.target_cube),
+            (self.robot_objects["secondary arm - part 2"], self.workplate),
+            (self.robot_objects["secondary arm - part 2"], self.target_cube),
+            (self.robot_objects["secondary arm - part 2"], self.robot_objects["base"]),
+            # tertiary arm
+            (self.robot_objects["tertiary arm - part 1"], self.workplate),
+            (self.robot_objects["tertiary arm - part 1"], self.robot_objects["base"]),
+            (self.robot_objects["tertiary arm - part 1"], self.target_cube),
+            (self.robot_objects["tertiary arm - part 2"], self.workplate),
+            (self.robot_objects["tertiary arm - part 2"], self.kallax_regal),
+            (self.robot_objects["tertiary arm - part 2"], self.robot_objects["base"]),
+            (self.robot_objects["tertiary arm - part 2"], self.target_cube),
+            # fingers
+            (self.robot_objects["finger - left"], self.workplate),
+            (self.robot_objects["finger - left"], self.kallax_regal),
+            (self.robot_objects["finger - left"], self.robot_objects["base"]),
+            (self.robot_objects["finger - left"], self.target_cube),
+            (self.robot_objects["finger - right"], self.workplate),
+            (self.robot_objects["finger - right"], self.kallax_regal),
+            (self.robot_objects["finger - right"], self.robot_objects["base"]),
+            (self.robot_objects["finger - right"], self.target_cube),
+        ]
+
+    def _mark_scene_dirty(self) -> None:
+        """Mark the Blender dependency graph as needing an update before queries."""
+        self._scene_dirty = True
+
+    def _ensure_scene_updated(self) -> None:
+        """Refresh transforms only once after a pose change, not on every query RPC."""
+        if self._scene_dirty:
+            bpy.context.view_layer.update()
+            self._scene_dirty = False
     
     def set_robot_pose(self, actuator_rotations: list[float]):
         """This function sets the robot to a defined pose based on the actuator rotations"""
@@ -63,7 +113,9 @@ class RobotEnv:
         # Print the world rotation (Euler angles) of "secondary arm - part 2"
         secondary_arm_obj = self.robot_objects["secondary arm - part 2"]
         world_euler = secondary_arm_obj.matrix_world.to_euler('XYZ')
-        print(f"Secondary Arm part 2 world rotation (radians): x={world_euler.x}, y={world_euler.y}, z={world_euler.z}")
+        if DEBUG_RPC_LOGS:
+            print(f"Secondary Arm part 2 world rotation (radians): x={world_euler.x}, y={world_euler.y}, z={world_euler.z}")
+        self._mark_scene_dirty()
     
     def reset(self, cube_position: str = "home", robot_pose: str = "home", actuator_rotations: list[float] | None = None):
         """
@@ -126,6 +178,7 @@ class RobotEnv:
         self.light_fenster.data.color = (random.uniform(0.5, 1), random.uniform(0.5, 1), random.uniform(0.5, 1))
         self.light_decke.data.color = (random.uniform(0.5, 1), random.uniform(0.5, 1), random.uniform(0.5, 1))
         self.light_sessel.data.color = (random.uniform(0.5, 1), random.uniform(0.5, 1), random.uniform(0.5, 1))
+        self._mark_scene_dirty()
     
     def target_cube_in_view(self, padding: float = 0.0) -> bool:
         """
@@ -133,7 +186,7 @@ class RobotEnv:
         The optional padding (in normalized [0, 1] units) shrinks the valid view region
         to avoid edge visibility counting as in-view.
         """
-        bpy.context.view_layer.update()  # Force update of transforms
+        self._ensure_scene_updated()
         scene = bpy.context.scene
         mesh = self.target_cube.data
         world_matrix = self.target_cube.matrix_world
@@ -143,7 +196,6 @@ class RobotEnv:
         min_bound = 0.0 + padding
         max_bound = 1.0 - padding
 
-        visible_coords = []
         for vertex in mesh.vertices:
             world_coord = world_matrix @ vertex.co
             co_ndc = world_to_camera_view(scene, self.camera, world_coord)
@@ -151,9 +203,9 @@ class RobotEnv:
             if (min_bound <= co_ndc.x <= max_bound and
                 min_bound <= co_ndc.y <= max_bound and
                 co_ndc.z > 0):
-                visible_coords.append((co_ndc.x, co_ndc.y))
+                return True
 
-        return bool(visible_coords)
+        return False
 
     def get_state(
             self, 
@@ -168,6 +220,10 @@ class RobotEnv:
         ):
         """Returns the state of the environment at the current time"""
         return_values = {}
+
+        # Any matrix_world / collision / visibility queries require an up-to-date depsgraph.
+        if target_cube_state or collisions or workplate_coverage or distance_to_target:
+            self._ensure_scene_updated()
 
         # actuator rotations
         actual_actuator_rotations = [
@@ -314,40 +370,26 @@ class RobotEnv:
         
     def _check_for_collision(self) -> bool:
         """This function checks wehter the robot is colliding wiht itself or the workplate"""
-        pairs = [
-            # primary arm
-            [self.robot_objects["primary arm"], self.robot_objects["secondary arm - part 2"]],
-            [self.robot_objects["primary arm"], self.robot_objects["tertiary arm - part 1"]],
-            [self.robot_objects["primary arm"], self.robot_objects["tertiary arm - part 2"]],
-            [self.robot_objects["primary arm"], self.robot_objects["finger - right"]],
-            [self.robot_objects["primary arm"], self.robot_objects["finger - left"]],
-            # secondary arm
-            [self.robot_objects["secondary arm - part 1"], self.workplate],
-            [self.robot_objects["secondary arm - part 1"], self.target_cube],
-            [self.robot_objects["secondary arm - part 2"], self.workplate],
-            [self.robot_objects["secondary arm - part 2"], self.target_cube],
-            [self.robot_objects["secondary arm - part 2"], self.robot_objects["base"]],
-            # tertiary arm
-            [self.robot_objects["tertiary arm - part 1"], self.workplate],
-            [self.robot_objects["tertiary arm - part 1"], self.robot_objects["base"]],
-            [self.robot_objects["tertiary arm - part 1"], self.target_cube],
-            [self.robot_objects["tertiary arm - part 2"], self.workplate],
-            [self.robot_objects["tertiary arm - part 2"], self.kallax_regal],
-            [self.robot_objects["tertiary arm - part 2"], self.robot_objects["base"]],
-            [self.robot_objects["tertiary arm - part 2"], self.target_cube],
-            # fingers
-            [self.robot_objects["finger - left"], self.workplate],
-            [self.robot_objects["finger - left"], self.kallax_regal],
-            [self.robot_objects["finger - left"], self.robot_objects["base"]],
-            [self.robot_objects["finger - left"], self.target_cube],
-            [self.robot_objects["finger - right"], self.workplate],
-            [self.robot_objects["finger - right"], self.kallax_regal],
-            [self.robot_objects["finger - right"], self.robot_objects["base"]],
-            [self.robot_objects["finger - right"], self.target_cube],
-        ]
-        
-        # do collision detection
-        return any(self._mesh_intersects(pair[0], pair[1]) for pair in pairs)
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+
+        # Reuse one depsgraph and prune obvious non-overlaps before building BVHs.
+        for obj_a, obj_b in self._collision_pairs:
+            if self._mesh_intersects(obj_a, obj_b, depsgraph):
+                return True
+        return False
+
+    @staticmethod
+    def _aabb_overlap(obj_a, obj_b) -> bool:
+        """Cheap broad-phase check using transformed local bounding boxes."""
+        corners_a = [obj_a.matrix_world @ Vector(corner) for corner in obj_a.bound_box]
+        corners_b = [obj_b.matrix_world @ Vector(corner) for corner in obj_b.bound_box]
+
+        min_a = [min(c[i] for c in corners_a) for i in range(3)]
+        max_a = [max(c[i] for c in corners_a) for i in range(3)]
+        min_b = [min(c[i] for c in corners_b) for i in range(3)]
+        max_b = [max(c[i] for c in corners_b) for i in range(3)]
+
+        return all(min_a[i] <= max_b[i] and min_b[i] <= max_a[i] for i in range(3))
     
     @staticmethod
     def _mesh_intersects(obj_a, obj_b, depsgraph=None) -> bool:
@@ -357,6 +399,10 @@ class RobotEnv:
         """
         if depsgraph is None:
             depsgraph = bpy.context.evaluated_depsgraph_get()
+
+        # Most pairs will not be near each other; skip expensive mesh/BVH work.
+        if not RobotEnv._aabb_overlap(obj_a, obj_b):
+            return False
 
         # Get evaluated (modifier‑applied) objects
         eval_a = obj_a.evaluated_get(depsgraph)
@@ -410,6 +456,7 @@ class RobotEnv:
         else:
             self.robot_objects["finger - left"].rotation_euler.z = radians(235)
             self.robot_objects["finger - right"].rotation_euler.z = radians(125)
+        self._mark_scene_dirty()
         
         # calculate cost
         max_velocities = [6.7, 6.7, 6.7, 9.5, 6.7, 9.5]
@@ -476,7 +523,8 @@ class RLServerModalOperator(bpy.types.Operator):
                             # Handle request as before
                             if request["function"] == "reset":
                                 env.reset(request["args"]["cube_position"], request["args"]["robot_pose"])
-                                print(f'reset environment to cube_position={request["args"]["cube_position"]}, robot_pose={request["args"]["robot_pose"]}')
+                                if DEBUG_RPC_LOGS:
+                                    print(f'reset environment to cube_position={request["args"]["cube_position"]}, robot_pose={request["args"]["robot_pose"]}')
                             
                             if request["function"] == "get_state":
                                 result = env.get_state(
@@ -490,7 +538,8 @@ class RLServerModalOperator(bpy.types.Operator):
                                     request["args"]["image"],
                                 )
                                 send_response(self._client_conn, {"result": result})
-                                print(f'retrieved and send environment state')
+                                if DEBUG_RPC_LOGS:
+                                    print('retrieved and send environment state')
                             
                             if request["function"] == "step":
                                 result = env.step(
@@ -498,16 +547,21 @@ class RLServerModalOperator(bpy.types.Operator):
                                     request["args"]["grapper_state"]
                                 )
                                 send_response(self._client_conn, {"result": result})
-                                print(f'updated env with actuator_velocities={request["args"]["actuator_velocities"]}, grapper_state={request["args"]["grapper_state"]} resulting in a cost of {result}')
+                                if DEBUG_RPC_LOGS:
+                                    print(f'updated env with actuator_velocities={request["args"]["actuator_velocities"]}, grapper_state={request["args"]["grapper_state"]} resulting in a cost of {result}')
                             
                             if request["function"] == "target_cube_in_view":
-                                result = env.target_cube_in_view()
+                                args = request.get("args", {})
+                                padding = float(args.get("padding", 0.0))
+                                result = env.target_cube_in_view(padding=padding)
                                 send_response(self._client_conn, {"result": result})
-                                print(f'checked if target cube is in view: {result}')
+                                if DEBUG_RPC_LOGS:
+                                    print(f'checked if target cube is in view with padding={padding}: {result}')
 
                             if request["function"] == "set_robot_pose":
                                 env.set_robot_pose(request["args"]["actuator_rotations"])
-                                print(f'set robot pose to {request["args"]["actuator_rotations"]}')
+                                if DEBUG_RPC_LOGS:
+                                    print(f'set robot pose to {request["args"]["actuator_rotations"]}')
                 
                 except BlockingIOError:
                     pass  # No data yet
@@ -529,7 +583,8 @@ class RLServerModalOperator(bpy.types.Operator):
         print("RL Env Server started (modal timer)")
 
         wm = context.window_manager
-        self._timer = wm.event_timer_add(0.1, window=context.window)
+        # Faster timer increases max RPC throughput and reduces client round-trip latency.
+        self._timer = wm.event_timer_add(SERVER_TIMER_INTERVAL_S, window=context.window)
         wm.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 

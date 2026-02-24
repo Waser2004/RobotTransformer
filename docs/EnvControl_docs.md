@@ -26,7 +26,7 @@ If your script runs inside Blender (instead of TCP), you can use the `RobotEnv` 
 
 - `set_robot_pose(actuator_rotations: list[float]) -> None`
 - `reset(cube_position: str = "home", robot_pose: str = "home", actuator_rotations: list[float] | None = None) -> None`
-- `target_cube_in_view() -> float`
+- `target_cube_in_view(padding: float = 0.0) -> bool`
 - `get_state(actuator_rotations=True, actuator_velocities=True, target_cube_state=True, graper=True, collisions=True, workplate_coverage=True, distance_to_target=True, image=False) -> dict`
 - `step(actuator_velocities: list[float] | None = None, grapper_state: bool | None = None) -> float`
 
@@ -210,27 +210,29 @@ Cost model (current implementation):
 
 ### 4. `target_cube_in_view`
 
-Compute normalized distance of cube center from image center using visible cube vertices.
+Return `true` when any part of the cube is visible in camera view.
 
 Request:
 
 ```json
 {
   "function": "target_cube_in_view",
-  "args": {}
+  "args": {
+    "padding": 0.1
+  }
 }
 ```
 
 Response:
 
 ```json
-{"result": <float_in_0_to_1>}
+{"result": <boolean>}
 ```
 
 Interpretation:
 
-- `0.0`: cube centered in image.
-- `1.0`: no cube vertex visible (or maximal normalized offset).
+- `true`: at least one cube vertex is visible within the `[padding, 1-padding]` image bounds.
+- `false`: no cube vertex is visible inside the padded bounds.
 
 ### 5. `set_robot_pose`
 
