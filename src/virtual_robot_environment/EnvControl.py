@@ -116,16 +116,41 @@ class RobotEnv:
         if DEBUG_RPC_LOGS:
             print(f"Secondary Arm part 2 world rotation (radians): x={world_euler.x}, y={world_euler.y}, z={world_euler.z}")
         self._mark_scene_dirty()
+
+    def _set_cube_invisible_pose(self):
+        """Place the cube well outside the camera/workplate while keeping a valid transform."""
+        self.target_cube.rotation_euler.x = 0
+        self.target_cube.rotation_euler.y = 0
+        self.target_cube.rotation_euler.z = 0
+        self.target_cube.location.x = -10.0
+        self.target_cube.location.y = 10.0
+        self.target_cube.location.z = -10.0
+        self._mark_scene_dirty()
+
+    def set_cube_gone(self):
+        """Hide the cube by moving it outside the observable scene."""
+        self._set_cube_invisible_pose()
+
+    def move_cube_random_on_workplate(self):
+        """Move the cube to a fresh random pose on the workplate without resetting the robot."""
+        self.target_cube.rotation_euler.x = 0
+        self.target_cube.rotation_euler.y = 0
+        self.target_cube.rotation_euler.z = random.uniform(0, 6.28)
+
+        self.target_cube.location.y = y = - random.uniform(100, 615) / 1000
+        self.target_cube.location.x = - (random.uniform(sqrt(135**2 - (-y * 1000 - 25)**2) + 25, 240) if -y < 0.16 else random.uniform(-50, 240)) / 1000
+        self.target_cube.location.z = 0.025
+        self._mark_scene_dirty()
     
     def reset(self, cube_position: str = "home", robot_pose: str = "home", actuator_rotations: list[float] | None = None):
         """
             This function resets the Environment to a defined starting state.
         
             Args:
-                cube_position: ["home", "random_on_workplate", "random_not_on_workplate"] defines the position of the cube
+                cube_position: ["home", "random_on_workplate", "random_not_on_workplate", "invisible"] defines the position of the cube
                 robot_pose: ["home", "resting", "random"] defines the pose of the robot
         """
-        assert cube_position in ["home", "random_on_workplate", "random_not_on_workplate"], "The cube position has to be \"home\", \"random_on_workplate\" or \"random_not_on_workplate\""
+        assert cube_position in ["home", "random_on_workplate", "random_not_on_workplate", "invisible"], "The cube position has to be \"home\", \"random_on_workplate\", \"random_not_on_workplate\" or \"invisible\""
         assert robot_pose in ["home", "resting", "random"], "The robot_pose has to be \"home\", \"resting\" or \"random\""
 
         # cube position
@@ -135,16 +160,14 @@ class RobotEnv:
             self.target_cube.location.z = 0.025
 
         elif cube_position == "random_on_workplate":
-            self.target_cube.rotation_euler.x = 0
-            self.target_cube.rotation_euler.y = 0
-            self.target_cube.rotation_euler.z = random.uniform(0, 6.28)
-
-            self.target_cube.location.y = y = - random.uniform(100, 615) / 1000
-            self.target_cube.location.x = - (random.uniform(sqrt(135**2 - (-y * 1000 - 25)**2) + 25, 240) if -y < 0.16 else random.uniform(-50, 240)) / 1000
-            self.target_cube.location.z = 0.025
+            self.move_cube_random_on_workplate()
 
         elif cube_position == "random_not_on_workplate":
             pass
+
+        elif cube_position == "invisible":
+            # Reuse the same off-scene placement used by the runtime disappearance RPC.
+            self._set_cube_invisible_pose()
 
         # robot pose
         if robot_pose == "home":
@@ -562,6 +585,16 @@ class RLServerModalOperator(bpy.types.Operator):
                                 env.set_robot_pose(request["args"]["actuator_rotations"])
                                 if DEBUG_RPC_LOGS:
                                     print(f'set robot pose to {request["args"]["actuator_rotations"]}')
+
+                            if request["function"] == "set_cube_gone":
+                                env.set_cube_gone()
+                                if DEBUG_RPC_LOGS:
+                                    print('moved target cube out of scene (gone)')
+
+                            if request["function"] == "move_cube_random_on_workplate":
+                                env.move_cube_random_on_workplate()
+                                if DEBUG_RPC_LOGS:
+                                    print('moved target cube to a random workplate position')
                 
                 except BlockingIOError:
                     pass  # No data yet

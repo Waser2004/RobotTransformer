@@ -45,8 +45,8 @@ class EnvClient:
         header = struct.pack(">I", len(payload))
         self._sock.sendall(header + payload)
 
-        # reset and set_robot_pose currently do not send a response in EnvControl.
-        if function in {"reset", "set_robot_pose"}:
+        # These control calls currently do not send a response in EnvControl.
+        if function in {"reset", "set_robot_pose", "set_cube_gone", "move_cube_random_on_workplate"}:
             return None
 
         response_header = self._recv_exact(4)
@@ -77,7 +77,7 @@ class EnvClient:
         return data
 
     def reset(self, cube_position: str = "home", robot_pose: str = "home", actuator_rotations=None) -> None:
-        """Reset environment to a known start state."""
+        """Reset environment to a known start state (supports e.g. cube_position='invisible')."""
         self._send(
             "reset",
             {
@@ -98,7 +98,8 @@ class EnvClient:
                 "graper": True,
                 "collisions": True,
                 "workplate_coverage": False,
-                "distance_to_target": False,
+                # The grab phase uses this to trigger disappearance scenarios near the cube.
+                "distance_to_target": True,
                 "image": image,
             },
         )
@@ -124,3 +125,11 @@ class EnvClient:
     def set_robot_pose(self, actuator_rotations) -> None:
         """Directly set robot pose in radians (mostly useful for debugging)."""
         self._send("set_robot_pose", {"actuator_rotations": list(actuator_rotations)})
+
+    def set_cube_gone(self) -> None:
+        """Move the cube out of the scene so it can no longer be found by the camera/search."""
+        self._send("set_cube_gone", {})
+
+    def move_cube_random_on_workplate(self) -> None:
+        """Relocate the cube to a new random valid workplate position during an episode."""
+        self._send("move_cube_random_on_workplate", {})

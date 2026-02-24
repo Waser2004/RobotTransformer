@@ -2,6 +2,7 @@ import json
 import importlib.util
 import math
 import os
+import random
 import sys
 import types
 import uuid
@@ -41,6 +42,9 @@ ACTUATOR_BOUNDS_DEG = [
 class Config:
     host: str = "localhost"
     port: int = 5055
+    invisible_cube_probability: float = 0       # default 1%
+    grab_cube_disappears_probability: float = 0 # default 10%
+    grab_cube_moves_probability: float = 1.0    # default 10%
 
 class JSONLWriter:
     """Simple incremental JSONL writer."""
@@ -93,13 +97,20 @@ class JSONLWriter:
         step_record.setdefault("t", len(self._active_steps))
         self._active_steps.append(step_record)
 
-    def commit_sequence(self, final_meta: Optional[Dict[str, Any]] = None) -> None:
+    def commit_sequence(
+        self,
+        final_meta: Optional[Dict[str, Any]] = None,
+        success: Optional[bool] = None,
+    ) -> None:
         """Finalize and write the buffered sequence as one JSONL line."""
         if self._active_sequence is None:
             raise RuntimeError("No active sequence. Call begin_sequence() before commit_sequence().")
 
         sequence_record = dict(self._active_sequence)
         sequence_record["steps"] = list(self._active_steps)
+        if success is not None:
+            # Allow callers to persist non-optimal/failed episodes without changing the schema shape.
+            sequence_record["success"] = bool(success)
 
         # Preserve phase order of first appearance for downstream phase-aware training.
         seen_phases = set()
@@ -371,24 +382,52 @@ class OptimalExpertGenerator:
         self.fk_model = RobotFKModel()
         self.ik_solver = InverseKinematics()
         self._collision_model = RobotCollisionModel(self.fk_model)
+        # Tracks the most recent grab failure mode so generate() can route non-optimal handling.
+        self._last_grab_failure_reason: Optional[str] = None
 
     def generate(self, num_episodes: int = 10):
         """Generate expert data for a number of episodes and write to JSONL file."""
         for episode in range(num_episodes):
+            # Clamp to a safe range so accidental config values do not break sampling behavior.
+            invisible_cube_probability       = max(0.0, min(1.0, float(self.config.invisible_cube_probability)))
+            grab_cube_disappears_probability = max(0.0, min(1.0, float(self.config.grab_cube_disappears_probability)))
+            grab_cube_moves_probability      = max(0.0, min(1.0, float(self.config.grab_cube_moves_probability)))
+            selected_cube_position = (
+                "invisible" if random.random() < invisible_cube_probability else "random_on_workplate"
+            )
+            # Only schedule mid-grab disappearance episodes when a cube exists to be found initially.
+            should_disappear_during_grab = (
+                selected_cube_position != "invisible"
+                and random.random() < grab_cube_disappears_probability
+            )
+            # Keep move/disappear mutually exclusive so one episode has one perturbation label.
+            should_move_during_grab = (
+                selected_cube_position != "invisible"
+                and not should_disappear_during_grab
+                and random.random() < grab_cube_moves_probability
+            )
+
             # reset env
-            self.env.reset(cube_position="random_on_workplate", robot_pose="home")
+            self.env.reset(cube_position=selected_cube_position, robot_pose="home")
             search_visibility_padding = 0.1
             grab_waypoint_step_mm = 20.0
+            cube_disappear_trigger_distance_mm = 50.0
 
             sequence_id = self.writer.begin_sequence(
                 {
                     "episode_index": episode,
                     "reset": {
-                        "cube_position": "random_on_workplate",
+                        "cube_position": selected_cube_position,
                         "robot_pose": "home",
                     },
                     "visibility_padding": search_visibility_padding,
                     "waypoint_step_mm": grab_waypoint_step_mm,
+                    "invisible_cube_probability": invisible_cube_probability,
+                    "grab_cube_disappears_probability": grab_cube_disappears_probability,
+                    "grab_cube_moves_probability": grab_cube_moves_probability,
+                    "grab_cube_disappears_trigger_distance_mm": cube_disappear_trigger_distance_mm,
+                    "planned_grab_cube_disappearance": should_disappear_during_grab,
+                    "planned_grab_cube_move": should_move_during_grab,
                 }
             )
             if self.video_writer is not None:
@@ -398,13 +437,137 @@ class OptimalExpertGenerator:
                 # search and grab are stored as a single transformer training sequence.
                 search_success = self.search(visibility_padding=search_visibility_padding)
                 if not search_success:
+                    # Search miss is a valid non-optimal episode: return home and persist the trajectory.
+                    return_home_success = self._return_home(reason="search_target_not_found")
+                    video_meta: Dict[str, Any] = {}
                     if self.video_writer is not None:
-                        self.video_writer.abort_episode()
-                    self.writer.abort_sequence("search_failed")
+                        video_meta = self.video_writer.commit_episode()
+                    self.writer.commit_sequence(
+                        {
+                            "search_success": False,
+                            "grab_success": False,
+                            "termination_reason": "search_target_not_found",
+                            "outcome_label": "failure_unrecoverable",
+                            "episode_id": sequence_id,
+                            "video": video_meta if video_meta else None,
+                            "return_home_attempted": True,
+                            "return_home_success": return_home_success,
+                        },
+                        success=False,
+                    )
                     continue
 
-                grab_success = self.grab(waypoint_step_mm=grab_waypoint_step_mm)
+                grab_success = self.grab(
+                    waypoint_step_mm=grab_waypoint_step_mm,
+                    allow_cube_disappear=should_disappear_during_grab,
+                    allow_cube_move=should_move_during_grab,
+                    cube_disappear_distance_mm=cube_disappear_trigger_distance_mm,
+                    cube_move_distance_mm=cube_disappear_trigger_distance_mm,
+                )
+
                 if not grab_success:
+                    if self._last_grab_failure_reason == "cube_disappeared_during_grab":
+                        # Resume searching from the current pose after the target disappears mid-approach.
+                        fallback_search_success = self.search(visibility_padding=search_visibility_padding)
+                        return_home_success = self._return_home(reason="cube_disappeared_during_grab")
+                        video_meta: Dict[str, Any] = {}
+                        if self.video_writer is not None:
+                            video_meta = self.video_writer.commit_episode()
+                        self.writer.commit_sequence(
+                            {
+                                "search_success": True,
+                                "grab_success": False,
+                                "termination_reason": "cube_disappeared_during_grab",
+                                "outcome_label": "failure_unrecoverable",
+                                "episode_id": sequence_id,
+                                "video": video_meta if video_meta else None,
+                                "fallback_search_attempted": True,
+                                "fallback_search_success": fallback_search_success,
+                                "cube_disappeared_during_grab": True,
+                                "grab_failure_reason": self._last_grab_failure_reason,
+                                "return_home_attempted": True,
+                                "return_home_success": return_home_success,
+                            },
+                            success=False,
+                        )
+                        continue
+                    if self._last_grab_failure_reason == "cube_moved_during_grab":
+                        # Resume searching from the current pose, then retry the grab once without further perturbations.
+                        fallback_search_success = self.search(visibility_padding=search_visibility_padding)
+                        if not fallback_search_success:
+                            return_home_success = self._return_home(reason="cube_moved_during_grab_search_failed")
+                            video_meta: Dict[str, Any] = {}
+                            if self.video_writer is not None:
+                                video_meta = self.video_writer.commit_episode()
+                            self.writer.commit_sequence(
+                                {
+                                    "search_success": True,
+                                    "grab_success": False,
+                                    "termination_reason": "cube_moved_during_grab_search_failed",
+                                    "outcome_label": "failure_unrecoverable",
+                                    "episode_id": sequence_id,
+                                    "video": video_meta if video_meta else None,
+                                    "fallback_search_attempted": True,
+                                    "fallback_search_success": False,
+                                    "cube_moved_during_grab": True,
+                                    "grab_failure_reason": self._last_grab_failure_reason,
+                                    "return_home_attempted": True,
+                                    "return_home_success": return_home_success,
+                                },
+                                success=False,
+                            )
+                            continue
+
+                        retry_grab_success = self.grab(
+                            waypoint_step_mm=grab_waypoint_step_mm,
+                            allow_cube_disappear=False,
+                            allow_cube_move=False,
+                            cube_disappear_distance_mm=cube_disappear_trigger_distance_mm,
+                            cube_move_distance_mm=cube_disappear_trigger_distance_mm,
+                        )
+                        if not retry_grab_success:
+                            return_home_success = self._return_home(reason="cube_moved_during_grab_regrab_failed")
+                            video_meta: Dict[str, Any] = {}
+                            if self.video_writer is not None:
+                                video_meta = self.video_writer.commit_episode()
+                            self.writer.commit_sequence(
+                                {
+                                    "search_success": True,
+                                    "grab_success": False,
+                                    "termination_reason": "cube_moved_during_grab_regrab_failed",
+                                    "outcome_label": "failure_unrecoverable",
+                                    "episode_id": sequence_id,
+                                    "video": video_meta if video_meta else None,
+                                    "fallback_search_attempted": True,
+                                    "fallback_search_success": True,
+                                    "retry_grab_attempted": True,
+                                    "retry_grab_success": False,
+                                    "cube_moved_during_grab": True,
+                                    "grab_failure_reason": self._last_grab_failure_reason,
+                                    "return_home_attempted": True,
+                                    "return_home_success": return_home_success,
+                                },
+                                success=False,
+                            )
+                            continue
+
+                        video_meta: Dict[str, Any] = {}
+                        if self.video_writer is not None:
+                            video_meta = self.video_writer.commit_episode()
+                        self.writer.commit_sequence(
+                            {
+                                "search_success": True,
+                                "grab_success": True,
+                                "episode_id": sequence_id,
+                                "video": video_meta if video_meta else None,
+                                "fallback_search_attempted": True,
+                                "fallback_search_success": True,
+                                "retry_grab_attempted": True,
+                                "retry_grab_success": True,
+                                "cube_moved_during_grab": True,
+                            }
+                        )
+                        continue
                     if self.video_writer is not None:
                         self.video_writer.abort_episode()
                     self.writer.abort_sequence("grab_failed")
@@ -470,11 +633,44 @@ class OptimalExpertGenerator:
         
         return False
 
+    def _return_home(self, reason: str = "episode_end") -> bool:
+        """Move the robot back to the configured home pose and log the motion as its own phase."""
+        try:
+            while True:
+                state = self.env.get_state(image=False)
+                current_actuator_rad = state["actuator_rotations"]
+                current_actuator_deg = [math.degrees(rad) for rad in current_actuator_rad]
+
+                # No-op return is allowed when search already ended at home.
+                if all(
+                    abs(current - target) < 0.5
+                    for current, target in zip(current_actuator_deg, HOME_ACTUATOR_DEG)
+                ):
+                    return True
+
+                self._move_to_target(
+                    current_actuator_deg,
+                    HOME_ACTUATOR_DEG,
+                    phase="return_home",
+                    state_before=state,
+                    step_meta={
+                        "return_reason": reason,
+                    },
+                )
+        except Exception:
+            # Best-effort cleanup path for non-optimal episodes should not discard the episode on return failure.
+            return False
+
     def grab(
         self,
         waypoint_step_mm: float = 20,
+        allow_cube_disappear: bool = False,
+        allow_cube_move: bool = False,
+        cube_disappear_distance_mm: float = 50.0,
+        cube_move_distance_mm: float = 50.0,
     ) -> bool:
         """Approach cube with look-at IK waypoints and close gripper at final pre-grasp pose."""
+        self._last_grab_failure_reason = None
 
         def _normalize(vec: List[float], eps: float = 1e-8) -> Optional[List[float]]:
             norm = math.sqrt(sum(v * v for v in vec))
@@ -528,6 +724,7 @@ class OptimalExpertGenerator:
 
         initial_state = self.env.get_state(image=False)
         if initial_state.get("collisions", False):
+            self._last_grab_failure_reason = "grab_initial_collision"
             return False
 
         # calculate target cube position
@@ -620,6 +817,10 @@ class OptimalExpertGenerator:
         waypoint_pose.append(final_target_actuator_deg)
 
         # move through waypoints
+        cube_disappearance_triggered = False
+        cube_move_triggered = False
+        cube_disappear_distance_m = max(0.0, float(cube_disappear_distance_mm)) / 1000.0
+        cube_move_distance_m = max(0.0, float(cube_move_distance_mm)) / 1000.0
         for waypoint_idx, target_actuator_deg in enumerate(waypoint_pose):
             state = self.env.get_state(image=False)
 
@@ -632,6 +833,7 @@ class OptimalExpertGenerator:
             )
             if planned_segment is None:
                 print("No collision-free path found for segment, aborting grab.")
+                self._last_grab_failure_reason = "grab_path_planning_failed"
                 return False
 
             # Execute each planned path waypoint; abort immediately on any observed collision.
@@ -641,6 +843,22 @@ class OptimalExpertGenerator:
                     
                     current_actuator_rad = state["actuator_rotations"]
                     current_actuator_deg = [math.degrees(rad) for rad in current_actuator_rad]
+
+                    # Trigger the disappearance scenario only once, and only near the target.
+                    if allow_cube_disappear and not cube_disappearance_triggered:
+                        distance_to_target_m = state.get("distance_to_target")
+                        if isinstance(distance_to_target_m, (int, float)) and distance_to_target_m <= cube_disappear_distance_m:
+                            self.env.set_cube_gone()
+                            cube_disappearance_triggered = True
+                            self._last_grab_failure_reason = "cube_disappeared_during_grab"
+                            return False
+                    if allow_cube_move and not cube_move_triggered:
+                        distance_to_target_m = state.get("distance_to_target")
+                        if isinstance(distance_to_target_m, (int, float)) and distance_to_target_m <= cube_move_distance_m:
+                            self.env.move_cube_random_on_workplate()
+                            cube_move_triggered = True
+                            self._last_grab_failure_reason = "cube_moved_during_grab"
+                            return False
 
                     if all(
                         abs(current - target) < 0.5
@@ -659,6 +877,7 @@ class OptimalExpertGenerator:
                         },
                     )
 
+        self._last_grab_failure_reason = None
         return True
     
     def _load_search_path(self) -> List[List[float]]:
