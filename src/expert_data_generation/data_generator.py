@@ -1055,6 +1055,6 @@ if __name__ == "__main__":
     # Store videos at 10 Hz for easier playback review and alignment with the desired robot-speed preview.
     with JSONLWriter("docs/data/expert_data.jsonl") as writer, EpisodeVideoWriter("docs/data/expert_videos", fps=10) as video_writer:
         generator = OptimalExpertGenerator(env, config, writer, video_writer=video_writer)
-        generator.generate(num_episodes=10)
+        generator.generate(num_episodes=10000)
     
     env.close()
