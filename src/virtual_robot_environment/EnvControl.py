@@ -1,4 +1,5 @@
 import json
+import tempfile
 import time
 import random
 import socket
@@ -301,42 +302,51 @@ class RobotEnv:
         if image:
             scene = bpy.context.scene
             previous_camera = scene.camera
+            previous_filepath = scene.render.filepath
+            previous_file_format = scene.render.image_settings.file_format
+            previous_color_mode = scene.render.image_settings.color_mode
+            temp_render_path = None
+            temp_image = None
             try:
                 scene.camera = self.camera
 
-                # Render
+                # First try in-memory render result access because it avoids disk IO.
                 bpy.ops.render.render(write_still=False)
-
                 render_image = bpy.data.images.get('Render Result')
-                if render_image is None:
-                    raise RuntimeError("Render Result image is unavailable after render")
+                gray_image = self._extract_grayscale_image(render_image) if render_image is not None else None
 
-                width = int(render_image.size[0])
-                height = int(render_image.size[1])
-                if width <= 0 or height <= 0:
-                    raise RuntimeError(f"Render Result has invalid size {(width, height)}")
-
-                arr = np.array(render_image.pixels[:], dtype=np.float32)
-                expected_len = width * height * 4
-                if arr.size != expected_len:
-                    raise RuntimeError(
-                        f"Render Result pixel buffer has unexpected size {arr.size}, expected {expected_len}"
+                if gray_image is None:
+                    # Some headless Blender builds do not expose Render Result pixels reliably.
+                    temp_render_path = (
+                        Path(tempfile.gettempdir()) / f"robot_env_render_{int(time.time() * 1000)}.png"
                     )
+                    scene.render.image_settings.file_format = "PNG"
+                    scene.render.image_settings.color_mode = "RGB"
+                    scene.render.filepath = temp_render_path.as_posix()
+                    bpy.ops.render.render(write_still=True)
+                    temp_image = bpy.data.images.load(temp_render_path.as_posix(), check_existing=False)
+                    gray_image = self._extract_grayscale_image(temp_image)
 
-                rgba = arr.reshape((height, width, 4))
-                # Convert to grayscale directly from the render result so capture does not depend on compositor state.
-                gray = (
-                    0.2126 * rgba[:, :, 0]
-                    + 0.7152 * rgba[:, :, 1]
-                    + 0.0722 * rgba[:, :, 2]
-                )
-                return_values.update({"image": gray.tolist()})
+                if gray_image is None:
+                    raise RuntimeError("No readable image data was produced by Blender render")
+
+                return_values.update({"image": gray_image, "image_error": None})
             except Exception as exc:
-                # Image frames are optional for training data generation; return a null frame instead of dropping the RPC connection.
-                print(f"Image capture error: {exc}")
-                return_values.update({"image": None})
+                # Keep the RPC connection alive and return the reason so the client can surface it.
+                print(f"Image capture error: {exc}", flush=True)
+                return_values.update({"image": None, "image_error": str(exc)})
             finally:
+                if temp_image is not None:
+                    bpy.data.images.remove(temp_image)
+                if temp_render_path is not None:
+                    try:
+                        temp_render_path.unlink()
+                    except OSError:
+                        pass
                 scene.camera = previous_camera
+                scene.render.filepath = previous_filepath
+                scene.render.image_settings.file_format = previous_file_format
+                scene.render.image_settings.color_mode = previous_color_mode
 
         return return_values
     
@@ -358,6 +368,27 @@ class RobotEnv:
         rel_z = (grab_world_euler.y - cube_world_euler.z)
 
         return (rel_x, rel_y, rel_z)
+
+    @staticmethod
+    def _extract_grayscale_image(image_data) -> list | None:
+        """Convert a Blender RGBA image datablock into a grayscale nested list."""
+        width = int(image_data.size[0])
+        height = int(image_data.size[1])
+        if width <= 0 or height <= 0:
+            return None
+
+        arr = np.array(image_data.pixels[:], dtype=np.float32)
+        expected_len = width * height * 4
+        if arr.size != expected_len:
+            return None
+
+        rgba = arr.reshape((height, width, 4))
+        gray = (
+            0.2126 * rgba[:, :, 0]
+            + 0.7152 * rgba[:, :, 1]
+            + 0.0722 * rgba[:, :, 2]
+        )
+        return gray.tolist()
 
     def _check_point_visibility(self):
         """Checks which points of the workplate are currently visible to the camera"""

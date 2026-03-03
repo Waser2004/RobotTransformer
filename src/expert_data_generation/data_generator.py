@@ -401,28 +401,32 @@ class OptimalExpertGenerator:
         self,
         state_without_image: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Fetch state with images when possible, otherwise fall back to a no-image payload."""
+        """Fetch state with images and retry transient Blender render stalls before failing."""
         if self.video_writer is None:
             return state_without_image if state_without_image is not None else self.env.get_state(image=False)
 
-        try:
-            state_record = self.env.get_state(image=True)
-        except EnvRPCError as exc:
-            # EnvControl closes the socket on handler exceptions, so reconnect before continuing without images.
-            self.env.close()
-            self.env.connect()
-            self._disable_video_capture(f"image RPC failed ({exc})")
-            if state_without_image is not None:
-                return state_without_image
-            return self.env.get_state(image=False)
+        failure_reasons: List[str] = []
+        for attempt in range(3):
+            try:
+                state_record = self.env.get_state(image=True)
+            except (EnvRPCError, TimeoutError) as exc:
+                # EnvControl may still be rendering or may have dropped the socket on a handler failure.
+                self.env.close()
+                self.env.connect()
+                failure_reasons.append(f"attempt {attempt + 1}: RPC error ({exc})")
+                time.sleep(1.0)
+                continue
 
-        if state_record.get("image") is None:
-            self._disable_video_capture("Blender image capture returned no frame")
-            if state_without_image is not None:
-                return state_without_image
-            return self.env.get_state(image=False)
+            if state_record.get("image") is not None:
+                return state_record
 
-        return state_record
+            image_error = state_record.get("image_error") or "Blender image capture returned no frame"
+            failure_reasons.append(f"attempt {attempt + 1}: {image_error}")
+            time.sleep(1.0)
+
+        raise RuntimeError(
+            "Blender image capture failed after 3 attempts: " + "; ".join(failure_reasons)
+        )
 
     def generate(self, num_episodes: int = 10):
         """Generate expert data for a number of episodes and write to JSONL file."""
