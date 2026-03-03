@@ -19,7 +19,7 @@ try:
     import cv2
 except ImportError:  # pragma: no cover - runtime dependency may be absent in some environments.
     cv2 = None
-from env_client import EnvClient
+from env_client import EnvClient, EnvRPCError
 from robot_kinematics.inverse_kinematics import InverseKinematics
 from robot_kinematics.forward_kinematics import RobotFKModel
 from robot_kinematics.collision_detection import RobotCollisionModel
@@ -384,6 +384,45 @@ class OptimalExpertGenerator:
         self._collision_model = RobotCollisionModel(self.fk_model)
         # Tracks the most recent grab failure mode so generate() can route non-optimal handling.
         self._last_grab_failure_reason: Optional[str] = None
+
+    def _disable_video_capture(self, reason: str) -> None:
+        """Drop optional preview-video capture so headless image RPC failures do not abort generation."""
+        if self.video_writer is None:
+            return
+        try:
+            self.video_writer.abort_episode()
+        except RuntimeError:
+            # The active episode may already be closed; best-effort cleanup is enough here.
+            self.video_writer.close()
+        self.video_writer = None
+        print(f"[generator] Disabled episode video capture: {reason}")
+
+    def _get_logging_state(
+        self,
+        state_without_image: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Fetch state with images when possible, otherwise fall back to a no-image payload."""
+        if self.video_writer is None:
+            return state_without_image if state_without_image is not None else self.env.get_state(image=False)
+
+        try:
+            state_record = self.env.get_state(image=True)
+        except EnvRPCError as exc:
+            # EnvControl closes the socket on handler exceptions, so reconnect before continuing without images.
+            self.env.close()
+            self.env.connect()
+            self._disable_video_capture(f"image RPC failed ({exc})")
+            if state_without_image is not None:
+                return state_without_image
+            return self.env.get_state(image=False)
+
+        if state_record.get("image") is None:
+            self._disable_video_capture("Blender image capture returned no frame")
+            if state_without_image is not None:
+                return state_without_image
+            return self.env.get_state(image=False)
+
+        return state_record
 
     def generate(self, num_episodes: int = 10):
         """Generate expert data for a number of episodes and write to JSONL file."""
@@ -920,17 +959,15 @@ class OptimalExpertGenerator:
             velocity = (delta / max_time)
             velocity_commands.append(velocity * STEP_VELOCITY_SIGN[i])
 
-        need_images = self.video_writer is not None
-
         # Logged sequence state is intentionally minimal; images are stored in episode video files.
         if state_before is None:
-            state_before_record = self.env.get_state(image=need_images)
-        elif need_images and state_before.get("image") is None:
-            state_before_record = self.env.get_state(image=True)
+            state_before_record = self._get_logging_state()
+        elif self.video_writer is not None and state_before.get("image") is None:
+            state_before_record = self._get_logging_state(state_without_image=state_before)
         else:
             state_before_record = state_before
         self.env.step(velocity_commands, grapper_state=False)
-        state_after_record = self.env.get_state(image=need_images)
+        state_after_record = self._get_logging_state()
 
         state_before_min = self._extract_logged_state(state_before_record)
         state_after_min = self._extract_logged_state(state_after_record)

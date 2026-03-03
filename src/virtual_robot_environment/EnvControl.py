@@ -300,40 +300,43 @@ class RobotEnv:
         # image
         if image:
             scene = bpy.context.scene
-            scene.use_nodes = True
-            tree = scene.node_tree
-            links = tree.links
+            previous_camera = scene.camera
+            try:
+                scene.camera = self.camera
 
-            # Clear default nodes
-            for node in tree.nodes:
-                tree.nodes.remove(node)
+                # Render
+                bpy.ops.render.render(write_still=False)
 
-            # Add Render Layers node
-            rl = tree.nodes.new('CompositorNodeRLayers')
-            rl.location = (185, 285)
+                render_image = bpy.data.images.get('Render Result')
+                if render_image is None:
+                    raise RuntimeError("Render Result image is unavailable after render")
 
-            # Add RGB to BW node (grayscale conversion)
-            rgb2bw = tree.nodes.new('CompositorNodeRGBToBW')
-            rgb2bw.location = (400, 285)
+                width = int(render_image.size[0])
+                height = int(render_image.size[1])
+                if width <= 0 or height <= 0:
+                    raise RuntimeError(f"Render Result has invalid size {(width, height)}")
 
-            # Add Viewer node
-            v = tree.nodes.new('CompositorNodeViewer')
-            v.location = (750, 210)
-            v.use_alpha = False
+                arr = np.array(render_image.pixels[:], dtype=np.float32)
+                expected_len = width * height * 4
+                if arr.size != expected_len:
+                    raise RuntimeError(
+                        f"Render Result pixel buffer has unexpected size {arr.size}, expected {expected_len}"
+                    )
 
-            # Link Render Layers → RGB to BW → Viewer
-            links.new(rl.outputs['Image'], rgb2bw.inputs['Image'])
-            links.new(rgb2bw.outputs['Val'], v.inputs['Image'])
-
-            # Render
-            bpy.ops.render.render(write_still=False)
-
-            # Access pixel data from Viewer Node
-            viewer_image = bpy.data.images['Viewer Node']
-            w, h = scene.render.resolution_x, scene.render.resolution_y
-            arr = np.array(viewer_image.pixels[:], dtype=np.float32)
-            arr = arr.reshape((h, w, 4))[:, :, 0]  # Only one channel (grayscale)
-            return_values.update({"image": arr.tolist()})
+                rgba = arr.reshape((height, width, 4))
+                # Convert to grayscale directly from the render result so capture does not depend on compositor state.
+                gray = (
+                    0.2126 * rgba[:, :, 0]
+                    + 0.7152 * rgba[:, :, 1]
+                    + 0.0722 * rgba[:, :, 2]
+                )
+                return_values.update({"image": gray.tolist()})
+            except Exception as exc:
+                # Image frames are optional for training data generation; return a null frame instead of dropping the RPC connection.
+                print(f"Image capture error: {exc}")
+                return_values.update({"image": None})
+            finally:
+                scene.camera = previous_camera
 
         return return_values
     
