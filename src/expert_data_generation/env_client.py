@@ -11,10 +11,18 @@ class EnvRPCError(RuntimeError):
 class EnvClient:
     """Small TCP JSON-RPC client for the Blender RobotEnv server."""
 
-    def __init__(self, host: str = "localhost", port: int = 5055, timeout_s: float = 10.0):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5055,
+        timeout_s: float = 10.0,
+        image_timeout_s: Optional[float] = None,
+    ):
         self.host = host
         self.port = port
         self.timeout_s = timeout_s
+        # Rendering the first frame in a fresh headless Blender session can take much longer than control RPCs.
+        self.image_timeout_s = float(image_timeout_s) if image_timeout_s is not None else max(float(timeout_s), 120.0)
         self._sock: Optional[socket.socket] = None
 
     def connect(self) -> None:
@@ -89,20 +97,30 @@ class EnvClient:
 
     def get_state(self, image: bool = True) -> Dict[str, Any]:
         """Read full state payload needed by expert data generation."""
-        result = self._send(
-            "get_state",
-            {
-                "actuator_rotations": True,
-                "actuator_velocities": True,
-                "target_cube_state": True,
-                "graper": True,
-                "collisions": True,
-                "workplate_coverage": False,
-                # The grab phase uses this to trigger disappearance scenarios near the cube.
-                "distance_to_target": True,
-                "image": image,
-            },
-        )
+        original_timeout: Optional[float] = None
+        if image and self._sock is not None:
+            original_timeout = self._sock.gettimeout()
+            self._sock.settimeout(self.image_timeout_s)
+
+        try:
+            result = self._send(
+                "get_state",
+                {
+                    "actuator_rotations": True,
+                    "actuator_velocities": True,
+                    "target_cube_state": True,
+                    "graper": True,
+                    "collisions": True,
+                    "workplate_coverage": False,
+                    # The grab phase uses this to trigger disappearance scenarios near the cube.
+                    "distance_to_target": True,
+                    "image": image,
+                },
+            )
+        finally:
+            if image and self._sock is not None and original_timeout is not None:
+                self._sock.settimeout(original_timeout)
+
         if not isinstance(result, dict):
             raise EnvRPCError("get_state returned non-dict payload")
         return result
