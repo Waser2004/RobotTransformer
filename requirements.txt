@@ -1,0 +1,10 @@
+# Runtime dependencies for expert data generation on EC2.
+# Blender provides `bpy`, `bmesh`, and related modules; they are not installed via pip.
+# Headless Ubuntu still needs system packages like `xvfb`/`xauth` outside this file.
+
+numpy
+scipy
+trimesh
+python-fcl
+opencv-python
+imageio[ffmpeg]
