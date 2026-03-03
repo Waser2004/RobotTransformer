@@ -5,6 +5,7 @@ import socket
 import struct
 import numpy as np
 from math import sqrt, radians, pi, degrees
+from pathlib import Path
 
 import bpy
 import bmesh
@@ -14,6 +15,7 @@ from mathutils.bvhtree import BVHTree
 
 DEBUG_RPC_LOGS = False
 SERVER_TIMER_INTERVAL_S = 0.02
+GRID_CENTERS_PATH = Path(__file__).resolve().parent / "docs" / "grid_centers.txt"
 
 
 class RobotEnv:
@@ -356,8 +358,14 @@ class RobotEnv:
 
     def _check_point_visibility(self):
         """Checks which points of the workplate are currently visible to the camera"""
-        # load platepoints from file
-        points_np = np.loadtxt("D:/OneDrive - Venusnet/Dokumente/4. Robot V2/Alythion/0. blender/docs/grid_centers.txt")
+        # Load workplate points from the repo so the server works on Windows and Linux.
+        if not GRID_CENTERS_PATH.exists():
+            if DEBUG_RPC_LOGS:
+                print(f"Grid centers file not found: {GRID_CENTERS_PATH}. Returning empty coverage.")
+            return []
+
+        points_np = np.loadtxt(GRID_CENTERS_PATH)
+        points_np = np.atleast_2d(points_np)
 
         scene = bpy.context.scene
         visibility_status = []

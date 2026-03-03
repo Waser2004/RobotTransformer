@@ -145,10 +145,16 @@ def ensure_inputs_exist(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"Missing {label}: {path}")
 
 
-def build_blender_bootstrap_script(env_control_path: Path, host: str, port: int) -> str:
+def build_blender_bootstrap_script(
+    env_control_path: Path,
+    host: str,
+    port: int,
+    ready_sentinel_path: Path,
+) -> str:
     """Create a temporary Blender Python bootstrap script that autostarts EnvControl."""
     env_control_path_posix = env_control_path.resolve().as_posix()
     host_literal = host.replace("\\", "\\\\").replace('"', '\\"')
+    ready_sentinel_literal = ready_sentinel_path.resolve().as_posix()
     # Keep the bootstrap script minimal and explicit because it runs inside Blender's Python.
     return f"""import importlib.util
 import traceback
@@ -157,6 +163,7 @@ import bpy
 ENV_CONTROL_PATH = r"{env_control_path_posix}"
 SERVER_HOST = "{host_literal}"
 SERVER_PORT = {int(port)}
+READY_SENTINEL_PATH = r"{ready_sentinel_literal}"
 
 def _load_envcontrol_module():
     spec = importlib.util.spec_from_file_location("robot_envcontrol_autostart", ENV_CONTROL_PATH)
@@ -188,6 +195,9 @@ def _start_server_when_ui_ready():
                 result = bpy.ops.wm.rl_env_server_modal()
         else:
             result = bpy.ops.wm.rl_env_server_modal({{"window": window, "screen": window.screen}})
+        # The wrapper waits on this file so headless runs do not depend on stdout flushing.
+        with open(READY_SENTINEL_PATH, "w", encoding="utf-8") as ready_handle:
+            ready_handle.write("ready\\n")
         print(f"AUTOSTART: server operator started -> {{result}}")
     except Exception as exc:
         print(f"AUTOSTART: failed to start server operator: {{exc}}")
@@ -259,10 +269,13 @@ def wait_for_blender_server_start(
     blender_proc: subprocess.Popen[str],
     streams: ProcessStreams,
     timeout_s: float,
+    ready_sentinel_path: Path,
 ) -> None:
-    """Wait for Blender to print the EnvControl startup marker or fail fast if it exits."""
+    """Wait for Blender to report readiness or fail fast if it exits."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
+        if ready_sentinel_path.exists():
+            return
         if streams.ready_event.wait(timeout=0.25):
             return
         exit_code = blender_proc.poll()
@@ -314,10 +327,12 @@ def main() -> int:
         )
 
     repo_root = Path(__file__).resolve().parents[2]
+    ready_sentinel_path = Path(tempfile.gettempdir()) / f"robot_env_ready_{int(time.time() * 1000)}.flag"
     bootstrap_contents = build_blender_bootstrap_script(
         env_control_path=Path(args.env_control_script),
         host=str(args.host),
         port=int(args.port),
+        ready_sentinel_path=ready_sentinel_path,
     )
     bootstrap_file = write_temp_bootstrap(bootstrap_contents)
 
@@ -354,7 +369,12 @@ def main() -> int:
         )
 
         streams = spawn_blender_log_reader(blender_proc.stdout, args.blender_log_file)
-        wait_for_blender_server_start(blender_proc, streams, args.startup_timeout_s)
+        wait_for_blender_server_start(
+            blender_proc,
+            streams,
+            args.startup_timeout_s,
+            ready_sentinel_path,
+        )
         print("[runner] Blender EnvControl server is ready.")
 
         generator_exit_code = run_generator_process(
@@ -379,6 +399,11 @@ def main() -> int:
         try:
             if bootstrap_file.exists():
                 bootstrap_file.unlink()
+        except OSError:
+            pass
+        try:
+            if ready_sentinel_path.exists():
+                ready_sentinel_path.unlink()
         except OSError:
             pass
 
