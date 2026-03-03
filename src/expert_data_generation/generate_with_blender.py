@@ -174,12 +174,20 @@ module.register()
 print(f"AUTOSTART: EnvControl loaded host={{SERVER_HOST}} port={{SERVER_PORT}}")
 
 def _start_server_when_ui_ready():
-    # In GUI mode (including Xvfb on AWS), wait until a window context exists before starting the modal operator.
-    if bpy.context.window is None:
-        print("AUTOSTART: waiting for Blender UI window context...")
+    # Under Xvfb, bpy.context.window can remain None even after the window manager is ready.
+    window_manager = getattr(bpy.context, "window_manager", None)
+    windows = list(getattr(window_manager, "windows", [])) if window_manager is not None else []
+    if not windows:
+        print("AUTOSTART: waiting for Blender window manager windows...")
         return 0.25
+    window = windows[0]
     try:
-        result = bpy.ops.wm.rl_env_server_modal()
+        # Start the modal operator with an explicit window override so the timer can attach to a real UI window.
+        if hasattr(bpy.context, "temp_override"):
+            with bpy.context.temp_override(window=window, screen=window.screen):
+                result = bpy.ops.wm.rl_env_server_modal()
+        else:
+            result = bpy.ops.wm.rl_env_server_modal({{"window": window, "screen": window.screen}})
         print(f"AUTOSTART: server operator started -> {{result}}")
     except Exception as exc:
         print(f"AUTOSTART: failed to start server operator: {{exc}}")
